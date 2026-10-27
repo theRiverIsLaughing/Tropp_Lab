@@ -1,0 +1,257 @@
+# Linear discriminant analysis of a sensor-array response matrix.
+#
+# Every function below takes data that has already been tidied, and expects it 
+# in this form:
+#
+#   X       numeric matrix (or data frame) of responses. One row per measured
+#           sample, one column per sensor channel, no missing values. Column
+#           names identify the channel and are carried through to the output,
+#           so name them for whatever the array measures - here
+#           "<element>_<wavelength>", e.g. "P2_660".
+#
+#   labels  factor of length nrow(X) giving the analyte for each row. Levels
+#           not present in the data should already be dropped.
+#
+# Designs are assumed balanced, or close to it, so LDA's default class priors
+# (the observed class proportions) are left alone.
+#
+# Requires: MASS, caret.
+#
+#   res <- analyse_array(X, labels)
+#   res$loocv$accuracy
+#   res$scores        # LD1..LDk per sample, for whatever plots the figure needs
+
+
+# Channel screening
+
+# Drop channels that carry no usable information.
+#
+# Three screens, in this order: constant channels, near-zero-variance
+# channels, then one of each pair correlated above the cutoff.
+#
+# @return list(keep = retained column indices, dropped = named character vector
+#   giving the reason each channel was removed)
+screen_channels <- function(X, corr_cutoff = 0.95) {
+  keep    <- seq_len(ncol(X))
+  dropped <- character(0)
+
+  flag <- function(idx, reason) {
+    if (length(idx)) {
+      dropped[colnames(X)[keep[idx]]] <<- reason
+      keep <<- keep[-idx]
+    }
+  }
+
+  v <- apply(X[, keep, drop = FALSE], 2, var)
+  flag(which(!is.finite(v) | v <= 0), "zero variance")
+
+  flag(caret::nearZeroVar(X[, keep, drop = FALSE]), "near-zero variance")
+
+  if (length(keep) > 1) {
+    cm <- cor(X[, keep, drop = FALSE])
+    flag(caret::findCorrelation(cm, cutoff = corr_cutoff),
+         sprintf("|r| > %.2f with another channel", corr_cutoff))
+  }
+
+  if (!length(keep)) stop("every channel was screened out")
+  list(keep = keep, dropped = dropped)
+}
+
+
+# Model
+
+# Fit LDA to a screened channel matrix.
+
+fit_array_lda <- function(X, labels) {
+  Z   <- scale(X)
+  fit <- MASS::lda(Z, grouping = labels)
+
+  # Share of between-class variance on each discriminant axis.
+  pct <- 100 * fit$svd^2 / sum(fit$svd^2)
+
+  list(fit = fit, Z = Z, labels = labels,
+       scores = as.data.frame(predict(fit, Z)$x),
+       pct_trace = pct, n_axes = length(fit$svd))
+}
+
+
+# Validation 
+
+# Leave-one-out cross-validation.
+#
+# @param refit_preprocessing when TRUE the channel screens and the centring
+#   and scaling constants are recomputed from the training samples inside every
+#   fold instead of once on the whole dataset. 
+
+loocv_lda <- function(X, labels, refit_preprocessing = FALSE, corr_cutoff = 0.95) {
+  if (!refit_preprocessing) {
+    # MASS does this internally and faster: one call, n refits, held-out
+    # predictions returned in sample order.
+    predicted <- MASS::lda(scale(X), grouping = labels, CV = TRUE)$class
+  } else {
+    predicted <- factor(rep(NA_character_, nrow(X)), levels = levels(labels))
+    for (i in seq_len(nrow(X))) {
+      keep <- screen_channels(X[-i, , drop = FALSE], corr_cutoff)$keep
+      mu   <- colMeans(X[-i, keep, drop = FALSE])
+      sdev <- apply(X[-i, keep, drop = FALSE], 2, sd)
+      f    <- MASS::lda(scale(X[-i, keep, drop = FALSE], mu, sdev),
+                        grouping = droplevels(labels[-i]))
+      predicted[i] <- as.character(
+        predict(f, scale(X[i, keep, drop = FALSE], mu, sdev))$class)
+    }
+  }
+
+  # A class with a single sample has no training examples left when that sample
+  # is held out, so MASS returns NA for it. table() drops NAs without saying so.
+  # Count them as errors instead.
+  cm        <- table(True = labels, Predicted = predicted)
+  n_unclass <- sum(is.na(predicted))
+  if (n_unclass > 0) {
+    warning(sprintf(
+      "%d sample(s) unclassifiable in cross-validation (%s); counted as incorrect",
+      n_unclass, paste(unique(as.character(labels[is.na(predicted)])), collapse = ", ")),
+      call. = FALSE)
+  }
+
+  list(predicted      = predicted,
+       confusion      = cm,
+       n_samples      = length(predicted),
+       n_correct      = sum(diag(cm)),
+       n_unclassified = n_unclass,
+       accuracy       = 100 * sum(diag(cm)) / length(predicted),
+       sensitivity    = 100 * diag(cm) / rowSums(cm))
+}
+
+# Cross-validated accuracy with the classifier restricted to the first k
+# discriminant axes.
+#
+# Comparing k = 2 against the full space.
+
+loocv_subspace <- function(X, labels, k = 2) {
+  Z    <- scale(X)
+  pred <- factor(rep(NA_character_, nrow(X)), levels = levels(labels))
+
+  for (i in seq_len(nrow(X))) {
+    ytr <- droplevels(labels[-i])
+    f   <- MASS::lda(Z[-i, , drop = FALSE], grouping = ytr)
+    kk  <- min(k, ncol(f$scaling))
+
+    s_tr <- predict(f, Z[-i, , drop = FALSE])$x[, seq_len(kk), drop = FALSE]
+    s_te <- predict(f, Z[i,  , drop = FALSE])$x[, seq_len(kk), drop = FALSE]
+    ctr  <- vapply(split(as.data.frame(s_tr), ytr), colMeans, numeric(kk))
+
+    pred[i] <- colnames(ctr)[which.min(colSums((ctr - as.numeric(s_te))^2))]
+  }
+
+  cm <- table(True = labels, Predicted = pred)
+  list(k = k, predicted = pred, confusion = cm,
+       accuracy = 100 * sum(diag(cm)) / length(pred))
+}
+
+
+# Channel contributions
+
+# Per-channel share of each discriminant axis, as a percentage.
+#
+#   "coefficient" - squared discriminant coefficients, i.e. the LDA weights.
+#                   How much the fitted axis leans on each channel, which
+#                   depends on what else is in the model.
+#   "structure"   - squared correlations between each channel and the
+#                   discriminant score. How well the channel tracks the axis on
+#                   its own, ignoring the rest of the array.
+#
+
+channel_contributions <- function(model, method = c("structure", "coefficient"),
+                                  axes = 1:2) {
+  method <- match.arg(method)
+  axes   <- axes[axes <= model$n_axes]
+
+  M <- switch(method,
+    coefficient = model$fit$scaling[, axes, drop = FALSE],
+    structure   = cor(model$Z, as.matrix(model$scores)[, axes, drop = FALSE])
+  )
+
+  pct <- sweep(M^2, 2, colSums(M^2), "/") * 100
+  out <- data.frame(Channel = rownames(M), pct, check.names = FALSE)
+  names(out)[-1] <- paste0("F", axes)
+  out$Total <- rowSums(out[, -1, drop = FALSE])
+  out[order(-out$Total), ]
+}
+
+
+# ---- Entry point -----------------------------------------------------------
+
+# Screen, fit, validate and attribute, in one call.
+#
+# @param nested_loocv adds a second cross-validation with the preprocessing
+#   refit inside each fold, for comparison against the standard one
+# @param subspace_k adds a cross-validation restricted to the first k
+#   discriminant axes; NULL to skip
+analyse_array <- function(X, labels, corr_cutoff = 0.95,
+                          contribution_method = "structure",
+                          nested_loocv = FALSE, subspace_k = 2) {
+
+  X      <- as.matrix(X)
+  labels <- droplevels(as.factor(labels))
+  stopifnot(nrow(X) == length(labels), all(is.finite(X)))
+
+  # Cross-validation needs at least two samples per class to mean anything.
+
+  thin <- names(which(table(labels) < 2))
+  if (length(thin)) {
+    warning(sprintf("class(es) with a single sample: %s - not validatable by LOOCV",
+                    paste(thin, collapse = ", ")), call. = FALSE)
+  }
+
+  screen <- screen_channels(X, corr_cutoff)
+  Xk     <- X[, screen$keep, drop = FALSE]
+  model  <- fit_array_lda(Xk, labels)
+
+  res <- list(
+    n_samples        = nrow(Xk),
+    n_classes        = nlevels(labels),
+    class_sizes      = table(labels),
+    channels_kept    = colnames(Xk),
+    channels_dropped = screen$dropped,
+    X                = Xk,
+    model            = model,
+    scores           = cbind(Analyte = as.character(labels), model$scores),
+    pct_trace        = model$pct_trace,
+    loocv            = loocv_lda(Xk, labels, FALSE, corr_cutoff),
+    contributions    = channel_contributions(model, contribution_method)
+  )
+  if (nested_loocv) res$loocv_nested <- loocv_lda(Xk, labels, TRUE, corr_cutoff)
+  if (!is.null(subspace_k)) res$loocv_subspace <- loocv_subspace(Xk, labels, subspace_k)
+  res
+}
+
+# One-screen summary of a result from analyse_array().
+report_array <- function(res, digits = 1) {
+  cat(sprintf("  %d samples, %d analytes, %d of %d channels modelled\n",
+              res$n_samples, res$n_classes, length(res$channels_kept),
+              length(res$channels_kept) + length(res$channels_dropped)))
+  if (length(res$channels_dropped)) {
+    cat(sprintf("  dropped: %s\n",
+                paste0(names(res$channels_dropped), " (", res$channels_dropped, ")",
+                       collapse = ", ")))
+  }
+  cat(sprintf("  %d discriminant axes; LD1-LD2 carry %.1f%% of between-class variance\n",
+              res$model$n_axes, sum(res$pct_trace[1:min(2, res$model$n_axes)])))
+  cat(sprintf("  LOOCV accuracy %.*f%% (%d/%d), chance %.1f%%\n",
+              digits, res$loocv$accuracy, res$loocv$n_correct,
+              res$loocv$n_samples, 100 / res$n_classes))
+  if (res$loocv$n_unclassified > 0) {
+    cat(sprintf("  %d sample(s) unclassifiable (singleton class), counted as incorrect\n",
+                res$loocv$n_unclassified))
+  }
+  if (!is.null(res$loocv_nested)) {
+    cat(sprintf("  LOOCV with fold-internal preprocessing %.*f%% (%d disagreements)\n",
+                digits, res$loocv_nested$accuracy,
+                sum(res$loocv$predicted != res$loocv_nested$predicted, na.rm = TRUE)))
+  }
+  if (!is.null(res$loocv_subspace)) {
+    cat(sprintf("  LOOCV restricted to LD1-LD%d %.*f%%\n",
+                res$loocv_subspace$k, digits, res$loocv_subspace$accuracy))
+  }
+  invisible(res)
+}
